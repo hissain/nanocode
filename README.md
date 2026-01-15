@@ -16,8 +16,27 @@ Built using Claude Code, then used to build itself.
 
 ## Usage
 
+### Anthropic Claude (default)
+
 ```bash
 export ANTHROPIC_API_KEY="your-key"
+python nanocode.py
+```
+
+### Google Gemini
+
+Use [Google Gemini](https://ai.google.dev/) models:
+
+```bash
+export GEMINI_API_KEY="your-key"
+python nanocode.py
+```
+
+To use a different Gemini model:
+
+```bash
+export GEMINI_API_KEY="your-key"
+export MODEL="gemini-2.0-flash-thinking-exp"
 python nanocode.py
 ```
 
@@ -37,6 +56,8 @@ export OPENROUTER_API_KEY="your-key"
 export MODEL="openai/gpt-5.2"
 python nanocode.py
 ```
+
+**Priority**: If multiple API keys are set, Gemini takes precedence, then OpenRouter, then Anthropic.
 
 ## Commands
 

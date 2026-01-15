@@ -3,9 +3,24 @@
 
 import glob as globlib, json, os, platform, re, shutil, subprocess, sys, urllib.request
 
+# API configuration
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-API_URL = "https://openrouter.ai/api/v1/messages" if OPENROUTER_KEY else "https://api.anthropic.com/v1/messages"
-MODEL = os.environ.get("MODEL", "anthropic/claude-opus-4.5" if OPENROUTER_KEY else "claude-opus-4-5")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
+
+# Determine provider and setup
+if GEMINI_KEY:
+    PROVIDER = "gemini"
+    MODEL = os.environ.get("MODEL", "gemini-2.0-flash-exp")
+    API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+elif OPENROUTER_KEY:
+    PROVIDER = "openrouter"
+    MODEL = os.environ.get("MODEL", "anthropic/claude-opus-4.5")
+    API_URL = "https://openrouter.ai/api/v1/messages"
+else:
+    PROVIDER = "anthropic"
+    MODEL = os.environ.get("MODEL", "claude-opus-4-5")
+    API_URL = "https://api.anthropic.com/v1/messages"
 
 # ANSI colors
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
@@ -173,6 +188,7 @@ def run_tool(name, args):
 
 
 def make_schema():
+    """Generate tool schema in provider-specific format."""
     result = []
     for name, (description, params, _fn) in TOOLS.items():
         properties = {}
@@ -180,13 +196,34 @@ def make_schema():
         for param_name, param_type in params.items():
             is_optional = param_type.endswith("?")
             base_type = param_type.rstrip("?")
-            properties[param_name] = {
-                "type": "integer" if base_type == "number" else base_type
-            }
+            prop_def = {"type": "integer" if base_type == "number" else base_type}
+            
+            # Gemini requires type in uppercase for some types
+            if PROVIDER == "gemini" and base_type == "string":
+                prop_def["type"] = "STRING"
+            elif PROVIDER == "gemini" and base_type == "number":
+                prop_def["type"] = "NUMBER"
+            elif PROVIDER == "gemini" and base_type == "boolean":
+                prop_def["type"] = "BOOLEAN"
+                
+            properties[param_name] = prop_def
             if not is_optional:
                 required.append(param_name)
-        result.append(
-            {
+        
+        if PROVIDER == "gemini":
+            # Gemini format
+            result.append({
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": properties,
+                    "required": required,
+                }
+            })
+        else:
+            # Anthropic/OpenRouter format
+            result.append({
                 "name": name,
                 "description": description,
                 "input_schema": {
@@ -194,31 +231,114 @@ def make_schema():
                     "properties": properties,
                     "required": required,
                 },
-            }
-        )
+            })
     return result
 
 
+def convert_messages_to_gemini(messages, system_prompt):
+    """Convert Anthropic message format to Gemini format."""
+    contents = []
+    
+    for msg in messages:
+        role = "user" if msg["role"] == "user" else "model"
+        
+        if isinstance(msg["content"], str):
+            contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+        elif isinstance(msg["content"], list):
+            parts = []
+            for item in msg["content"]:
+                if item["type"] == "text":
+                    parts.append({"text": item["text"]})
+                elif item["type"] == "tool_use":
+                    parts.append({
+                        "functionCall": {
+                            "name": item["name"],
+                            "args": item["input"]
+                        }
+                    })
+                elif item["type"] == "tool_result":
+                    parts.append({
+                        "functionResponse": {
+                            "name": "tool_result",
+                            "response": {"result": item["content"]}
+                        }
+                    })
+            if parts:
+                contents.append({"role": role, "parts": parts})
+    
+    return contents
+
+
+def convert_gemini_response(gemini_response):
+    """Convert Gemini response format to Anthropic format."""
+    content_blocks = []
+    
+    if "candidates" not in gemini_response or not gemini_response["candidates"]:
+        return {"content": [{"type": "text", "text": "No response from Gemini."}]}
+    
+    candidate = gemini_response["candidates"][0]
+    if "content" not in candidate:
+        return {"content": [{"type": "text", "text": "Empty response from Gemini."}]}
+    
+    parts = candidate["content"].get("parts", [])
+    
+    for part in parts:
+        if "text" in part:
+            content_blocks.append({"type": "text", "text": part["text"]})
+        elif "functionCall" in part:
+            fc = part["functionCall"]
+            content_blocks.append({
+                "type": "tool_use",
+                "id": fc.get("name", "unknown") + "_call",
+                "name": fc["name"],
+                "input": fc.get("args", {})
+            })
+    
+    return {"content": content_blocks}
+
+
 def call_api(messages, system_prompt):
-    request = urllib.request.Request(
-        API_URL,
-        data=json.dumps(
-            {
-                "model": MODEL,
-                "max_tokens": 8192,
-                "system": system_prompt,
-                "messages": messages,
-                "tools": make_schema(),
-            }
-        ).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-            **({"Authorization": f"Bearer {OPENROUTER_KEY}"} if OPENROUTER_KEY else {"x-api-key": os.environ.get("ANTHROPIC_API_KEY", "")}),
-        },
-    )
-    response = urllib.request.urlopen(request)
-    return json.loads(response.read())
+    """Call the appropriate API based on provider."""
+    if PROVIDER == "gemini":
+        # Gemini API format
+        contents = convert_messages_to_gemini(messages, system_prompt)
+        
+        payload = {
+            "contents": contents,
+            "tools": [{"functionDeclarations": make_schema()}],
+            "systemInstruction": {"parts": [{"text": system_prompt}]}
+        }
+        
+        url = f"{API_URL}?key={GEMINI_KEY}"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        response = urllib.request.urlopen(request)
+        gemini_response = json.loads(response.read())
+        return convert_gemini_response(gemini_response)
+    else:
+        # Anthropic/OpenRouter API format
+        request = urllib.request.Request(
+            API_URL,
+            data=json.dumps(
+                {
+                    "model": MODEL,
+                    "max_tokens": 8192,
+                    "system": system_prompt,
+                    "messages": messages,
+                    "tools": make_schema(),
+                }
+            ).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01",
+                **({"Authorization": f"Bearer {OPENROUTER_KEY}"} if OPENROUTER_KEY else {"x-api-key": ANTHROPIC_KEY}),
+            },
+        )
+        response = urllib.request.urlopen(request)
+        return json.loads(response.read())
 
 
 def separator():
@@ -231,7 +351,8 @@ def render_markdown(text):
 
 def main():
     system_info = get_system_info()
-    print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'Anthropic'}) | {os.getcwd()}{RESET}\n")
+    provider_name = PROVIDER.capitalize()
+    print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({provider_name}) | {os.getcwd()}{RESET}\n")
     messages = []
     system_prompt = f"""Concise coding assistant.
 {system_info}
